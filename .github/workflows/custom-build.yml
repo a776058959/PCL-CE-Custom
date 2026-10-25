@@ -118,19 +118,21 @@ jobs:
         run: |
           set -e
           dotnet publish 'Plain Craft Launcher 2/Plain Craft Launcher 2.csproj' \
-            -p:Configuration=CI -p:Platform=x64 --self-contained true -o ../artifact
+            -p:Configuration=Release -p:Platform=x64 --self-contained true -o ../artifact
 
       - name: Stage artifact
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
         run: |
           set -e
+          ls -1 ../artifact | head -20
+          if ls ../artifact/*.pdb >/dev/null 2>&1; then echo '::warning::产物里有 .pdb，说明仍在用 CI/Debug 配置'; fi
           mkdir -p dist
-          cp 'artifact/Plain Craft Launcher 2.exe' dist/PCL-CE-Custom-x64.exe
+          cp 'artifact/Plain Craft Launcher 2.exe' "dist/PCL-CE-Custom-$TAG-x64.exe"
           ls -lh dist
           if [ -n "$CLIENT_ID" ]; then echo 'CLIENT_ID: set'; else echo 'CLIENT_ID: not set'; fi
           if [ -n "$CLIENT_ID" ]; then
-            strings -el dist/PCL-CE-Custom-x64.exe | grep -qF "$CLIENT_ID" \
+            strings -el "dist/PCL-CE-Custom-$TAG-x64.exe" | grep -qF "$CLIENT_ID" \
               && echo 'client id found in binary' \
               || echo '::warning::CLIENT_ID 已配置但未在产物中找到，检查 PCL_WRITE_SECRET 与 env 变量名'
           fi
@@ -150,7 +152,7 @@ jobs:
         run: |
           set -e
           cd dist
-          zip -j PCL-CE-Custom-x64.zip PCL-CE-Custom-x64.exe
+          zip -j "PCL-CE-Custom-$TAG-x64.zip" "PCL-CE-Custom-$TAG-x64.exe"
           ls -lh
 
       - uses: actions/upload-artifact@v4
@@ -164,17 +166,31 @@ jobs:
           name: ${{ env.RELEASE_NAME }}
           body_path: body.md
           files: |
-            dist/PCL-CE-Custom-x64.exe
-            dist/PCL-CE-Custom-x64.zip
+            dist/PCL-CE-Custom-${{ env.TAG }}-x64.exe
+            dist/PCL-CE-Custom-${{ env.TAG }}-x64.zip
           make_latest: true
+
+      # 改过名的旧资产不会自动消失，这里清掉本 release 里不属于本次构建的资产
+      - name: Remove stale assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          for n in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
+            case "$n" in
+              "PCL-CE-Custom-$TAG-x64.exe"|"PCL-CE-Custom-$TAG-x64.zip"|*.sigstore.json) continue ;;
+            esac
+            echo "删除陈旧资产 $n"
+            gh release delete-asset "$TAG" "$n" --repo "$GITHUB_REPOSITORY" --yes
+          done
 
       # 启动器的更新源指向本仓库：这里生成它要的两个 JSON
       - name: Write update metadata
         run: |
           set -e
-          exe_sha=$(sha256sum dist/PCL-CE-Custom-x64.exe | cut -d' ' -f1)
+          exe_sha=$(sha256sum "dist/PCL-CE-Custom-$TAG-x64.exe" | cut -d' ' -f1)
           echo "exe sha256: $exe_sha"
-          EXE_SHA="$exe_sha" python3 - <<'PY'
+          EXE_SHA="$exe_sha" ZIP_NAME="PCL-CE-Custom-$TAG-x64.zip" python3 - <<'PY'
           import json, os, hashlib, pathlib
           meta = json.load(open('src/Plain Craft Launcher 2/metadata.json', encoding='utf-8'))['version']
           name = meta['base'] + (('-' + meta['suffix']) if meta.get('suffix') else '')
@@ -183,10 +199,10 @@ jobs:
           except FileNotFoundError:
               changelog = ''
           asset = {
-              'file_name': 'PCL-CE-Custom-x64.zip',
+              'file_name': os.environ['ZIP_NAME'],
               'version': {'channel': 'stable', 'name': name, 'code': meta['code']},
               'upd_time': os.environ.get('TAG', ''),
-              'downloads': ['https://github.com/%s/releases/download/%s/PCL-CE-Custom-x64.zip' % (os.environ['GITHUB_REPOSITORY'], os.environ['TAG'])],
+              'downloads': ['https://github.com/%s/releases/download/%s/%s' % (os.environ['GITHUB_REPOSITORY'], os.environ['TAG'], os.environ['ZIP_NAME'])],
               'patches': [],
               'sha256': os.environ['EXE_SHA'],
               'changelog': changelog,
