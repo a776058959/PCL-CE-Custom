@@ -1,0 +1,112 @@
+name: Custom build
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: custom-build
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/PCL-Community/PCL-CE.git
+  UPSTREAM_BRANCH: dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream
+        run: |
+          set -e
+          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" src
+          cd src
+          sha=$(git rev-parse --short HEAD)
+          echo "UPSTREAM_SHA=$sha" >> "$GITHUB_ENV"
+          echo "upstream: $sha $(git log -1 --format=%s)"
+
+      - name: Apply patches
+        working-directory: src
+        run: |
+          set -e
+          for p in ../patches/*.patch; do
+            echo "applying $p"
+            git apply --verbose "$p"
+          done
+
+      - name: Verify patches still cover every gate
+        working-directory: src
+        run: |
+          set -e
+          grep -q 'local-build-unrestricted' 'Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs' \
+            || { echo '::error::region gate patch did not land'; exit 1; }
+          grep -q '"SystemSystemUpdate", LauncherAutoUpdateBehavior.Disable' PCL.Core/App/Config.cs \
+            || { echo '::error::auto-update default patch did not land'; exit 1; }
+          # 打过补丁后，生产代码里不应再有任何 RegionPolicy.Evaluate 调用（测试目录除外）
+          n=$(grep -rn 'RegionPolicy\.Evaluate(' --include=*.cs . | grep -v '^\./PCL.Core.Test/' | wc -l)
+          [ "$n" -eq 0 ] || { echo "::error::upstream added RegionPolicy.Evaluate call site(s) outside tests: $n"; exit 1; }
+          grep -q 'McDownloadClient(' 'Plain Craft Launcher 2/Pages/PageDownload/ModDownloadLib.cs' \
+            || { echo '::error::download entry point is gone upstream'; exit 1; }
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Publish
+        working-directory: src
+        env:
+          PCL_WRITE_SECRET: '1'
+          PCL_MS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          PCL_CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+          PCL_GITHUB_SHA: ${{ env.UPSTREAM_SHA }}
+        run: |
+          set -e
+          dotnet publish 'Plain Craft Launcher 2/Plain Craft Launcher 2.csproj' \
+            -p:Configuration=CI -p:Platform=x64 --self-contained true -o ../artifact
+
+      - name: Stage artifact
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+        run: |
+          set -e
+          mkdir -p dist
+          cp 'artifact/Plain Craft Launcher 2.exe' dist/PCL-CE-Custom-x64.exe
+          ls -lh dist
+          if [ -n "$CLIENT_ID" ]; then echo 'CLIENT_ID: set'; else echo 'CLIENT_ID: not set'; fi
+          # 密文在程序集里是 UTF-16 字符串，用 strings -el 校验是否真的编进产物
+          if [ -n "$CLIENT_ID" ]; then
+            strings -el dist/PCL-CE-Custom-x64.exe | grep -qF "$CLIENT_ID" \
+              && echo 'client id found in binary' \
+              || echo '::warning::CLIENT_ID 已配置但未在产物中找到，检查 PCL_WRITE_SECRET 与 env 变量名'
+          fi
+          {
+            echo '解除区域限制 + 默认关闭自动更新检查。'
+            echo
+            echo "- 上游提交：\`$UPSTREAM_SHA\`"
+            echo "- 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo "- 补丁：$(ls ../patches | tr '\n' ' ')"
+          } > body.md
+          cat body.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PCL-CE-Custom-x64
+          path: dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: custom-latest
+          name: 定制构建（随上游更新）
+          body_path: body.md
+          files: dist/PCL-CE-Custom-x64.exe
+          make_latest: true
