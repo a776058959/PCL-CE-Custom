@@ -118,7 +118,7 @@ jobs:
         run: |
           set -e
           dotnet publish 'Plain Craft Launcher 2/Plain Craft Launcher 2.csproj' \
-            -p:Configuration=Release -p:Platform=x64 --self-contained true -o ../artifact
+            -p:Configuration=Release -p:Platform=x64 --no-self-contained -o ../artifact
 
       - name: Stage artifact
         env:
