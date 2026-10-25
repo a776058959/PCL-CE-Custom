@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: '上游 tag 或分支（留空 = 最新正式发版）'
+        type: string
+        required: false
   push:
     branches: [main]
     paths-ignore:
@@ -18,37 +23,42 @@ concurrency:
 
 env:
   UPSTREAM_REPO: https://github.com/PCL-Community/PCL-CE.git
-  UPSTREAM_BRANCH: dev
 
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      sha: ${{ steps.up.outputs.sha }}
+      ref: ${{ steps.up.outputs.ref }}
       changed: ${{ steps.cmp.outputs.changed }}
     steps:
-      - name: Read upstream head
+      - name: Resolve upstream ref
         id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ github.event.inputs.ref }}
         run: |
-          sha=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "upstream head: $sha"
+          if [ -n "$WANT" ]; then
+            ref="$WANT"
+          else
+            ref=$(gh api repos/PCL-Community/PCL-CE/releases/latest --jq .tag_name)
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "upstream ref: $ref"
 
-      - name: Compare with the newest build
+      - name: Compare with existing builds
         id: cmp
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ steps.up.outputs.sha }}
+          REF: ${{ steps.up.outputs.ref }}
         run: |
-          # 不依赖 API 返回顺序：扫最近 100 个 release 的正文里有没有这个提交号
           hits=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].body' 2>/dev/null \
-            | grep -cF "<!-- upstream:$SHA -->" || true)
+            | grep -cF "<!-- upstream:$REF -->" || true)
           if [ "${hits:-0}" -gt 0 ]; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
-            echo "上游提交 $SHA 已经构建过，跳过"
+            echo "$REF 已经构建过，跳过"
           else
             echo 'changed=true' >> "$GITHUB_OUTPUT"
-            echo "上游有新提交 $SHA，开始构建"
+            echo "$REF 还没构建过，开始"
           fi
 
   build:
@@ -58,15 +68,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone upstream
+      - name: Clone upstream at ref
+        env:
+          REF: ${{ needs.check.outputs.ref }}
         run: |
           set -e
-          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" src
+          git clone --depth 1 --branch "$REF" "$UPSTREAM_REPO" src
           cd src
-          sha=$(git rev-parse HEAD)
-          echo "UPSTREAM_SHA=$sha" >> "$GITHUB_ENV"
-          echo "TAG=build-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
-          echo "upstream: $sha $(git log -1 --format=%s)"
+          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "UPSTREAM_REF=$REF" >> "$GITHUB_ENV"
+          case "$REF" in
+            v*) echo "TAG=custom-$REF" >> "$GITHUB_ENV" ;;
+            *)  echo "TAG=custom-$REF-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV" ;;
+          esac
+          echo "upstream: $REF $(git log -1 --format=%h\ %s)"
 
       - name: Apply patches
         working-directory: src
@@ -121,13 +136,14 @@ jobs:
               || echo '::warning::CLIENT_ID 已配置但未在产物中找到，检查 PCL_WRITE_SECRET 与 env 变量名'
           fi
           {
-            echo '解除区域限制 + 默认关闭自动更新检查。'
+            echo "基于上游 \`$UPSTREAM_REF\` 构建，已解除区域限制并默认关闭自动检查更新。"
             echo
+            echo "- 上游版本：\`$UPSTREAM_REF\`"
             echo "- 上游提交：\`$(echo $UPSTREAM_SHA | cut -c1-7)\`"
             echo "- 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
             echo "- 补丁：$(ls patches | tr '\n' ' ')"
             echo
-            echo "<!-- upstream:$UPSTREAM_SHA -->"
+            echo "<!-- upstream:$UPSTREAM_REF -->"
           } > body.md
           cat body.md
 
@@ -149,15 +165,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
-            --json tagName,publishedAt > rels.json
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,publishedAt > rels.json
           python3 - <<'PY' > delete.txt
           import json, datetime
           rels = json.load(open('rels.json'))
           now = datetime.datetime.now(datetime.timezone.utc)
           cut = now - datetime.timedelta(days=30)
-          keep = set()
-          months = {}
+          keep, months = set(), {}
           for r in rels:
               t = datetime.datetime.fromisoformat(r['publishedAt'].replace('Z', '+00:00'))
               if t >= cut:
@@ -171,7 +185,7 @@ jobs:
               if r['tagName'] not in keep:
                   print(r['tagName'])
           PY
-          echo '--- keep / delete ---'
+          echo '--- to delete ---'
           cat delete.txt
           while read -r tag; do
             [ -z "$tag" ] && continue
