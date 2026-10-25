@@ -125,8 +125,8 @@ jobs:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
         run: |
           set -e
-          ls -1 ../artifact | head -20
-          if ls ../artifact/*.pdb >/dev/null 2>&1; then echo '::warning::产物里有 .pdb，说明仍在用 CI/Debug 配置'; fi
+          ls -1 artifact | head -20
+          if ls artifact/*.pdb >/dev/null 2>&1; then echo '::warning::产物里有 .pdb，说明仍在用 CI/Debug 配置'; fi
           mkdir -p dist
           cp 'artifact/Plain Craft Launcher 2.exe' "dist/PCL-CE-Custom-$TAG-x64.exe"
           ls -lh dist
