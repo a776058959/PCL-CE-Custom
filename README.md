@@ -19,7 +19,8 @@ fork 意味着本地背着上游的完整历史和几万个文件，每次上游
 ## 什么时候构建
 
 - 定时每 6 小时检查一次上游的**最新正式发版**（GitHub Releases 的 `latest`，自动跳过 beta）
-- 只有出现还没构建过的 tag 时才真正编译，同一个版本不会重复构建
+- 判定依据是仓库里的 `.github/upstream-lock.txt`（上次成功构建的上游 tag），构建成功后由 `record` job 自动写回并提交，同一个版本不会重复构建
+- 判定不看 release 列表，所以清理旧版本不会影响「是否需要构建」
 - 手动：Actions → Custom build → Run workflow；可在 `ref` 里指定上游 tag 或分支（例如临时要 dev 的最新修复就填 `dev`）
 
 产物版本号与上游一致：基于 `v2.15.1` 构建出来的就是 2.15.1，release tag 为 `custom-v2.15.1`。
