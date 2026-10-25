@@ -32,10 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.cmp.outputs.ref }}
+      tag: ${{ steps.cmp.outputs.tag }}
       changed: ${{ steps.cmp.outputs.changed }}
     steps:
       - uses: actions/checkout@v4
-      - name: Compare upstream release tag with lock file
+      - name: Resolve upstream ref and compare with lock
         id: cmp
         env:
           GH_TOKEN: ${{ github.token }}
@@ -44,18 +45,26 @@ jobs:
           set -e
           if [ -n "$WANT" ]; then ref="$WANT"; else ref=$(gh api "repos/$UPSTREAM_SLUG/releases/latest" --jq .tag_name); fi
           locked=$(tr -d '[:space:]' < .github/upstream-lock.txt 2>/dev/null || true)
+          case "$ref" in v*) tag="$ref" ;; *) tag="custom-$ref-$(date -u +%Y%m%d-%H%M)" ;; esac
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "上游目标: $ref / 上次构建: ${locked:-（无记录）}"
-          case "$ref" in
-            v*) if [ "$ref" = "$locked" ]; then echo 'changed=false' >> "$GITHUB_OUTPUT"; echo "$ref 已构建过，跳过";
-                else echo 'changed=true' >> "$GITHUB_OUTPUT"; echo "$ref 是新版本，开始构建"; fi ;;
-            *)  echo 'changed=true' >> "$GITHUB_OUTPUT"; echo "$ref 是分支，直接构建" ;;
-          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "上游: $ref（tag: $tag）上次构建: ${locked:-无}"
+          if [ "$ref" = "$locked" ]; then echo 'changed=false' >> "$GITHUB_OUTPUT"; echo '已构建过，跳过';
+          else echo 'changed=true' >> "$GITHUB_OUTPUT"; echo '需要构建'; fi
 
   build:
     needs: check
     if: needs.check.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   selfcontained: false, suffix: '' }
+          - { arch: x64,   selfcontained: true,  suffix: '-bundled' }
+          - { arch: arm64, selfcontained: false, suffix: '' }
+          - { arch: arm64, selfcontained: true,  suffix: '-bundled' }
+    name: build-${{ matrix.arch }}${{ matrix.suffix }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,25 +74,7 @@ jobs:
         run: |
           set -e
           git clone --depth 1 --branch "$REF" "$UPSTREAM_REPO" src
-          cd src
-          echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
-          echo "UPSTREAM_REF=$REF" >> "$GITHUB_ENV"
-          case "$REF" in
-            v*) echo "TAG=$REF" >> "$GITHUB_ENV" ;;
-            *)  echo "TAG=custom-$REF-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV" ;;
-          esac
-          echo "upstream: $REF $(git log -1 --format=%h\ %s)"
-
-      - name: Fetch upstream release notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REF: ${{ needs.check.outputs.ref }}
-        run: |
-          upstream_name=$(gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .name 2>/dev/null || true)
-          gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .body > upstream-body.md 2>/dev/null || true
-          if [ -z "$upstream_name" ]; then upstream_name="Release ${REF#v}"; fi
-          echo "RELEASE_NAME=$upstream_name" >> "$GITHUB_ENV"
-          echo "release name: $upstream_name"
+          cd src && echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Apply patches
         working-directory: src
@@ -100,7 +91,7 @@ jobs:
           grep -q 'raw.githubusercontent.com/a776058959/PCL-CE-Custom' 'Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs' \
             || { echo '::error::update source patch did not land'; exit 1; }
           n=$(grep -rn 'RegionPolicy\.Evaluate(' --include=*.cs . | grep -v '^\./PCL.Core.Test/' | wc -l)
-          [ "$n" -eq 0 ] || { echo "::error::upstream added RegionPolicy.Evaluate call site(s) outside tests: $n"; exit 1; }
+          [ "$n" -eq 0 ] || { echo "::error::RegionPolicy.Evaluate call sites outside tests: $n"; exit 1; }
           grep -q 'McDownloadClient(' 'Plain Craft Launcher 2/Pages/PageDownload/ModDownloadLib.cs' \
             || { echo '::error::download entry point is gone upstream'; exit 1; }
 
@@ -115,111 +106,146 @@ jobs:
           PCL_MS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
           PCL_CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
           PCL_GITHUB_SHA: ${{ env.UPSTREAM_SHA }}
+          SELF: ${{ matrix.selfcontained }}
         run: |
           set -e
+          if [ "$SELF" = "true" ]; then SC='--self-contained true'; else SC='--no-self-contained'; fi
           dotnet publish 'Plain Craft Launcher 2/Plain Craft Launcher 2.csproj' \
-            -p:Configuration=Release -p:Platform=x64 --no-self-contained -o ../artifact
+            -p:Configuration=Release -p:Platform=${{ matrix.arch }} $SC -o ../artifact
 
-      - name: Stage artifact
+      - name: Stage exe
         env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          FILE: PCL-CE-Custom-${{ needs.check.outputs.tag }}-${{ matrix.arch }}${{ matrix.suffix }}.exe
         run: |
           set -e
-          ls -1 artifact | head -20
-          if ls artifact/*.pdb >/dev/null 2>&1; then echo '::warning::产物里有 .pdb，说明仍在用 CI/Debug 配置'; fi
-          mkdir -p dist
-          cp 'artifact/Plain Craft Launcher 2.exe' "dist/PCL-CE-Custom-$TAG-x64.exe"
-          ls -lh dist
-          if [ -n "$CLIENT_ID" ]; then echo 'CLIENT_ID: set'; else echo 'CLIENT_ID: not set'; fi
-          if [ -n "$CLIENT_ID" ]; then
-            strings -el "dist/PCL-CE-Custom-$TAG-x64.exe" | grep -qF "$CLIENT_ID" \
-              && echo 'client id found in binary' \
-              || echo '::warning::CLIENT_ID 已配置但未在产物中找到，检查 PCL_WRITE_SECRET 与 env 变量名'
-          fi
-          {
-            echo "> **本版基于上游 \`$UPSTREAM_REF\`（提交 \`$(echo $UPSTREAM_SHA | cut -c1-7)\`）自行编译，解除了中国大陆地区的下载/安装限制。更新由本仓库提供，不是官方发布。**"
-            echo ">"
-            echo "> 构建于 $(date -u '+%Y-%m-%d %H:%M UTC')，补丁：$(ls patches | tr '\n' ' ')"
-            echo ""
-            echo "---"
-            echo ""
-            # 去掉上游正文里的 Mirror 酱广告（我们没有那个通道）
-            grep -v -i 'mirror 酱\|mirrorchyan\|你也可以直接在下方' upstream-body.md 2>/dev/null || true
-          } > body.md
-          head -6 body.md
-
-      - name: Package update zip
-        run: |
-          set -e
-          cd dist
-          zip -j "PCL-CE-Custom-$TAG-x64.zip" "PCL-CE-Custom-$TAG-x64.exe"
-          ls -lh
+          mkdir -p out
+          cp 'artifact/Plain Craft Launcher 2.exe' "out/$FILE"
+          ls -lh out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: PCL-CE-Custom-x64
-          path: dist/
+          name: exe-${{ matrix.arch }}${{ matrix.suffix }}
+          path: out/
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: collected
+
+      - name: Fetch upstream release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.check.outputs.ref }}
+        run: |
+          name=$(gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .name 2>/dev/null || true)
+          gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .body > upstream-body.md 2>/dev/null || true
+          if [ -z "$name" ]; then name="Release ${REF#v}"; fi
+          echo "RELEASE_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Assemble dist
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+          REF: ${{ needs.check.outputs.ref }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+        run: |
+          set -e
+          mkdir -p dist
+          find collected -name '*.exe' -exec cp {} dist/ \;
+          ls -lh dist
+          if [ -n "$CLIENT_ID" ]; then echo 'CLIENT_ID: set'; else echo 'CLIENT_ID: not set'; fi
+          for f in dist/*.exe; do
+            if [ -n "$CLIENT_ID" ] && strings -el "$f" | grep -qF "$CLIENT_ID"; then echo "client id ok: $(basename "$f")"; fi
+          done
+          (cd dist && zip -j "PCL-CE-Custom-$TAG-x64.zip" "PCL-CE-Custom-$TAG-x64.exe")
+          (cd dist && zip -j "PCL-CE-Custom-$TAG-arm64.zip" "PCL-CE-Custom-$TAG-arm64.exe")
+          ls -lh dist
+          {
+            echo "> **本版基于上游 \`$REF\` 自行编译，解除了中国大陆地区的下载/安装限制。更新由本仓库提供，不是官方发布。**"
+            echo ">"
+            echo "> 构建于 $(date -u '+%Y-%m-%d %H:%M UTC')，补丁：$(ls patches | tr '\n' ' ')"
+            echo ">"
+            echo "> 每个架构两种：不带后缀的需要机器装有 [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0)（约 22 MB）；带 \`-bundled\` 的自带运行时（约 190 MB），拷到没装运行时的机器也能直接跑。"
+            echo ""
+            echo "---"
+            echo ""
+            grep -v -i 'mirror 酱\|mirrorchyan\|你也可以直接在下方' upstream-body.md 2>/dev/null || true
+          } > body.md
+          head -8 body.md
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG }}
+          tag_name: ${{ needs.check.outputs.tag }}
           name: ${{ env.RELEASE_NAME }}
           body_path: body.md
           files: |
-            dist/PCL-CE-Custom-${{ env.TAG }}-x64.exe
-            dist/PCL-CE-Custom-${{ env.TAG }}-x64.zip
+            dist/*.exe
+            dist/*.zip
           make_latest: true
 
-      # 改过名的旧资产不会自动消失，这里清掉本 release 里不属于本次构建的资产
       - name: Remove stale assets
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -e
           for n in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'); do
             case "$n" in
-              "PCL-CE-Custom-$TAG-x64.exe"|"PCL-CE-Custom-$TAG-x64.zip"|*.sigstore.json) continue ;;
+              *.sigstore.json) continue ;;
+              PCL-CE-Custom-$TAG-*) continue ;;
             esac
             echo "删除陈旧资产 $n"
             gh release delete-asset "$TAG" "$n" --repo "$GITHUB_REPOSITORY" --yes
           done
 
-      # 启动器的更新源指向本仓库：这里生成它要的两个 JSON
       - name: Write update metadata
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -e
-          exe_sha=$(sha256sum "dist/PCL-CE-Custom-$TAG-x64.exe" | cut -d' ' -f1)
-          echo "exe sha256: $exe_sha"
-          EXE_SHA="$exe_sha" ZIP_NAME="PCL-CE-Custom-$TAG-x64.zip" python3 - <<'PY'
+          X64_SHA=$(sha256sum "dist/PCL-CE-Custom-$TAG-x64.exe" | cut -d' ' -f1)
+          ARM_SHA=$(sha256sum "dist/PCL-CE-Custom-$TAG-arm64.exe" | cut -d' ' -f1)
+          echo "x64=$X64_SHA"; echo "arm64=$ARM_SHA"
+          X64_SHA="$X64_SHA" ARM_SHA="$ARM_SHA" python3 - <<'PY'
           import json, os, hashlib, pathlib
           meta = json.load(open('src/Plain Craft Launcher 2/metadata.json', encoding='utf-8'))['version']
           name = meta['base'] + (('-' + meta['suffix']) if meta.get('suffix') else '')
+          repo, tag = os.environ['GITHUB_REPOSITORY'], os.environ['TAG']
           try:
               changelog = open('upstream-body.md', encoding='utf-8').read()
           except FileNotFoundError:
               changelog = ''
-          asset = {
-              'file_name': os.environ['ZIP_NAME'],
-              'version': {'channel': 'stable', 'name': name, 'code': meta['code']},
-              'upd_time': os.environ.get('TAG', ''),
-              'downloads': ['https://github.com/%s/releases/download/%s/%s' % (os.environ['GITHUB_REPOSITORY'], os.environ['TAG'], os.environ['ZIP_NAME'])],
-              'patches': [],
-              'sha256': os.environ['EXE_SHA'],
-              'changelog': changelog,
-          }
-          upddir = pathlib.Path('apiv2/updates'); upddir.mkdir(parents=True, exist_ok=True)
-          upd = upddir / 'updates-srx64.json'
-          upd.write_text(json.dumps({'assets': [asset]}, ensure_ascii=False, indent=2), encoding='utf-8')
+          upd_dir = pathlib.Path('apiv2/updates'); upd_dir.mkdir(parents=True, exist_ok=True)
+          cache = {}
+          for arch, sha in (('x64', os.environ['X64_SHA']), ('arm64', os.environ['ARM_SHA'])):
+              zip_name = 'PCL-CE-Custom-%s-%s.zip' % (tag, arch)
+              asset = {
+                  'file_name': zip_name,
+                  'version': {'channel': 'stable', 'name': name, 'code': meta['code']},
+                  'upd_time': tag,
+                  'downloads': ['https://github.com/%s/releases/download/%s/%s' % (repo, tag, zip_name)],
+                  'patches': [],
+                  'sha256': sha,
+                  'changelog': changelog,
+              }
+              f = upd_dir / ('updates-sr%s.json' % arch)
+              f.write_text(json.dumps({'assets': [asset]}, ensure_ascii=False, indent=2), encoding='utf-8')
+              cache['updates-sr%s' % arch] = hashlib.md5(f.read_bytes()).hexdigest()
           ann = pathlib.Path('apiv2/announcement.json')
           ann.write_text(json.dumps({'content': []}, ensure_ascii=False), encoding='utf-8')
-          cache = {'updates-srx64': hashlib.md5(upd.read_bytes()).hexdigest(),
-                   'announcement': hashlib.md5(ann.read_bytes()).hexdigest()}
+          cache['announcement'] = hashlib.md5(ann.read_bytes()).hexdigest()
           pathlib.Path('apiv2/cache.json').write_text(json.dumps(cache, indent=2), encoding='utf-8')
           print('version:', name, 'code:', meta['code'])
           print('cache:', cache)
           PY
 
       - name: Commit update metadata
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           set -e
           git config user.name 'github-actions[bot]'
@@ -228,13 +254,11 @@ jobs:
           if git diff --cached --quiet; then echo '元数据无变化'; else
             git commit -m "chore(update): $TAG [skip ci]"
             git push origin HEAD:main
-            echo '已提交更新元数据'
           fi
 
       - name: Prune old releases
         env:
           GH_TOKEN: ${{ github.token }}
-          DRY_RUN: '0'
         run: |
           set -e
           gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,publishedAt > rels.json
@@ -257,11 +281,10 @@ jobs:
               if r['tagName'] not in keep:
                   print(r['tagName'])
           PY
-          echo '--- to delete ---'; cat delete.txt
-          while read -r tag; do
-            [ -z "$tag" ] && continue
-            if [ "$DRY_RUN" = '1' ]; then echo "[dry-run] would delete $tag"; continue; fi
-            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          cat delete.txt
+          while read -r t; do
+            [ -z "$t" ] && continue
+            gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < delete.txt
 
   record:
@@ -282,5 +305,4 @@ jobs:
           if git diff --cached --quiet; then echo '锁文件未变化'; else
             git commit -m "chore(ci): upstream $REF built [skip ci]"
             git push origin HEAD:main
-            echo "已记录 $REF"
           fi
