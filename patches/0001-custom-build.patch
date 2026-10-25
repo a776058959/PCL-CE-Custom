@@ -25,3 +25,25 @@ index 252e4bb0..9779aaa1 100644
  
      internal static bool IsRestricted => Assess().IsRestricted;
  
+diff --git a/Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs b/Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs
+index bb48ef70..72785b10 100644
+--- a/Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs	
++++ b/Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs	
+@@ -12,15 +12,10 @@ public static class UpdateManager
+ {
+     public static bool isUpdateWaitingRestart;
+ 
++    // 本地定制构建：更新源只指向自己的仓库，避免被官方受限版覆盖
+     public static UpdatesWrapperModel remoteServer = new(new List<IUpdateSource>
+     {
+-        new UpdatesMirrorChyanModel(),
+-        new UpdatesRandomModel(new[]
+-        {
+-            new UpdatesMinioModel("https://s3.pysio.online/pcl2-ce/", "Pysio"),
+-            new UpdatesMinioModel("https://staticassets.naids.com/resources/pclce/", "Naids")
+-        }),
+-        new UpdatesMinioModel("https://github.com/PCL-Community/PCL2_CE_Server/raw/main/", "GitHub")
++        new UpdatesMinioModel("https://raw.githubusercontent.com/a776058959/PCL-CE-Custom/main/", "Custom")
+     });
+ 
+     public static bool IsCurrentVersionBeta

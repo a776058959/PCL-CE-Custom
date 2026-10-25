@@ -14,6 +14,7 @@ on:
     paths-ignore:
       - '**/*.md'
       - '.github/upstream-lock.txt'
+      - 'apiv2/**'
 
 permissions:
   contents: write
@@ -34,9 +35,6 @@ jobs:
       changed: ${{ steps.cmp.outputs.changed }}
     steps:
       - uses: actions/checkout@v4
-
-      # 判定依据是仓库里的 .github/upstream-lock.txt（上次成功构建的上游 tag），
-      # 不依赖 release 列表，也不会被保留策略清理掉。
       - name: Compare upstream release tag with lock file
         id: cmp
         env:
@@ -44,29 +42,14 @@ jobs:
           WANT: ${{ github.event.inputs.ref }}
         run: |
           set -e
-          if [ -n "$WANT" ]; then
-            ref="$WANT"
-          else
-            ref=$(gh api "repos/$UPSTREAM_SLUG/releases/latest" --jq .tag_name)
-          fi
+          if [ -n "$WANT" ]; then ref="$WANT"; else ref=$(gh api "repos/$UPSTREAM_SLUG/releases/latest" --jq .tag_name); fi
           locked=$(tr -d '[:space:]' < .github/upstream-lock.txt 2>/dev/null || true)
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "上游目标: $ref"
-          echo "上次构建: ${locked:-（无记录）}"
+          echo "上游目标: $ref / 上次构建: ${locked:-（无记录）}"
           case "$ref" in
-            v*)
-              if [ "$ref" = "$locked" ]; then
-                echo 'changed=false' >> "$GITHUB_OUTPUT"
-                echo "$ref 已构建过，跳过"
-              else
-                echo 'changed=true' >> "$GITHUB_OUTPUT"
-                echo "$ref 是新版本，开始构建"
-              fi
-              ;;
-            *)
-              echo 'changed=true' >> "$GITHUB_OUTPUT"
-              echo "$ref 是分支，直接构建"
-              ;;
+            v*) if [ "$ref" = "$locked" ]; then echo 'changed=false' >> "$GITHUB_OUTPUT"; echo "$ref 已构建过，跳过";
+                else echo 'changed=true' >> "$GITHUB_OUTPUT"; echo "$ref 是新版本，开始构建"; fi ;;
+            *)  echo 'changed=true' >> "$GITHUB_OUTPUT"; echo "$ref 是分支，直接构建" ;;
           esac
 
   build:
@@ -91,7 +74,6 @@ jobs:
           esac
           echo "upstream: $REF $(git log -1 --format=%h\ %s)"
 
-      # 发版说明直接沿用上游那一版的，保证版本号与更新日志一致
       - name: Fetch upstream release notes
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,21 +82,14 @@ jobs:
           upstream_name=$(gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .name 2>/dev/null || true)
           gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .body > upstream-body.md 2>/dev/null || true
           if [ -z "$upstream_name" ]; then upstream_name="Release ${REF#v}"; fi
-          {
-            echo "RELEASE_NAME=$upstream_name"
-            echo "UPSTREAM_BODY_BYTES=$(wc -c < upstream-body.md 2>/dev/null || echo 0)"
-          } >> "$GITHUB_ENV"
+          echo "RELEASE_NAME=$upstream_name" >> "$GITHUB_ENV"
           echo "release name: $upstream_name"
-          echo "upstream body bytes: $(wc -c < upstream-body.md 2>/dev/null || echo 0)"
 
       - name: Apply patches
         working-directory: src
         run: |
           set -e
-          for p in ../patches/*.patch; do
-            echo "applying $p"
-            git apply --verbose "$p"
-          done
+          for p in ../patches/*.patch; do echo "applying $p"; git apply --verbose "$p"; done
 
       - name: Verify patches still cover every gate
         working-directory: src
@@ -124,6 +99,8 @@ jobs:
             || { echo '::error::region gate patch did not land'; exit 1; }
           grep -q '"SystemSystemUpdate", LauncherAutoUpdateBehavior.Disable' PCL.Core/App/Config.cs \
             || { echo '::error::auto-update default patch did not land'; exit 1; }
+          grep -q 'raw.githubusercontent.com/a776058959/PCL-CE-Custom' 'Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs' \
+            || { echo '::error::update source patch did not land'; exit 1; }
           n=$(grep -rn 'RegionPolicy\.Evaluate(' --include=*.cs . | grep -v '^\./PCL.Core.Test/' | wc -l)
           [ "$n" -eq 0 ] || { echo "::error::upstream added RegionPolicy.Evaluate call site(s) outside tests: $n"; exit 1; }
           grep -q 'McDownloadClient(' 'Plain Craft Launcher 2/Pages/PageDownload/ModDownloadLib.cs' \
@@ -170,6 +147,13 @@ jobs:
           } > body.md
           head -6 body.md
 
+      - name: Package update zip
+        run: |
+          set -e
+          cd dist
+          zip -j PCL-CE-Custom-x64.zip PCL-CE-Custom-x64.exe
+          ls -lh
+
       - uses: actions/upload-artifact@v4
         with:
           name: PCL-CE-Custom-x64
@@ -180,8 +164,57 @@ jobs:
           tag_name: ${{ env.TAG }}
           name: ${{ env.RELEASE_NAME }}
           body_path: body.md
-          files: dist/PCL-CE-Custom-x64.exe
+          files: |
+            dist/PCL-CE-Custom-x64.exe
+            dist/PCL-CE-Custom-x64.zip
           make_latest: true
+
+      # 启动器的更新源指向本仓库：这里生成它要的两个 JSON
+      - name: Write update metadata
+        run: |
+          set -e
+          exe_sha=$(sha256sum dist/PCL-CE-Custom-x64.exe | cut -d' ' -f1)
+          echo "exe sha256: $exe_sha"
+          EXE_SHA="$exe_sha" python3 - <<'PY'
+          import json, os, hashlib, pathlib
+          meta = json.load(open('src/Plain Craft Launcher 2/metadata.json', encoding='utf-8'))['version']
+          name = meta['base'] + (('-' + meta['suffix']) if meta.get('suffix') else '')
+          try:
+              changelog = open('upstream-body.md', encoding='utf-8').read()
+          except FileNotFoundError:
+              changelog = ''
+          asset = {
+              'file_name': 'PCL-CE-Custom-x64.zip',
+              'version': {'channel': 'stable', 'name': name, 'code': meta['code']},
+              'upd_time': os.environ.get('TAG', ''),
+              'downloads': ['https://github.com/%s/releases/download/%s/PCL-CE-Custom-x64.zip' % (os.environ['GITHUB_REPOSITORY'], os.environ['TAG'])],
+              'patches': [],
+              'sha256': os.environ['EXE_SHA'],
+              'changelog': changelog,
+          }
+          upddir = pathlib.Path('apiv2/updates'); upddir.mkdir(parents=True, exist_ok=True)
+          upd = upddir / 'updates-srx64.json'
+          upd.write_text(json.dumps({'assets': [asset]}, ensure_ascii=False, indent=2), encoding='utf-8')
+          ann = pathlib.Path('apiv2/announcement.json')
+          ann.write_text(json.dumps({'content': []}, ensure_ascii=False), encoding='utf-8')
+          cache = {'updates-srx64': hashlib.md5(upd.read_bytes()).hexdigest(),
+                   'announcement': hashlib.md5(ann.read_bytes()).hexdigest()}
+          pathlib.Path('apiv2/cache.json').write_text(json.dumps(cache, indent=2), encoding='utf-8')
+          print('version:', name, 'code:', meta['code'])
+          print('cache:', cache)
+          PY
+
+      - name: Commit update metadata
+        run: |
+          set -e
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add apiv2
+          if git diff --cached --quiet; then echo '元数据无变化'; else
+            git commit -m "chore(update): $TAG [skip ci]"
+            git push origin HEAD:main
+            echo '已提交更新元数据'
+          fi
 
       - name: Prune old releases
         env:
@@ -209,8 +242,7 @@ jobs:
               if r['tagName'] not in keep:
                   print(r['tagName'])
           PY
-          echo '--- to delete ---'
-          cat delete.txt
+          echo '--- to delete ---'; cat delete.txt
           while read -r tag; do
             [ -z "$tag" ] && continue
             if [ "$DRY_RUN" = '1' ]; then echo "[dry-run] would delete $tag"; continue; fi
@@ -232,9 +264,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .github/upstream-lock.txt
-          if git diff --cached --quiet; then
-            echo '锁文件未变化'
-          else
+          if git diff --cached --quiet; then echo '锁文件未变化'; else
             git commit -m "chore(ci): upstream $REF built [skip ci]"
             git push origin HEAD:main
             echo "已记录 $REF"
