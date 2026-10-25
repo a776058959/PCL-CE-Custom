@@ -2,7 +2,7 @@ name: Custom build
 
 on:
   schedule:
-    - cron: '0 4 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
   push:
     branches: [main]
@@ -21,7 +21,37 @@ env:
   UPSTREAM_BRANCH: dev
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.up.outputs.sha }}
+      changed: ${{ steps.cmp.outputs.changed }}
+    steps:
+      - name: Read upstream head
+        id: up
+        run: |
+          sha=$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "upstream head: $sha"
+
+      - name: Compare with the newest build
+        id: cmp
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.up.outputs.sha }}
+        run: |
+          body=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=1" --jq '.[0].body // ""' 2>/dev/null || true)
+          if printf '%s' "$body" | grep -q "<!-- upstream:$SHA -->"; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo "上游未更新（$SHA），跳过构建"
+          else
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            echo "发现上游新提交（$SHA）"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.changed == 'true' || github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,8 +61,9 @@ jobs:
           set -e
           git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" src
           cd src
-          sha=$(git rev-parse --short HEAD)
+          sha=$(git rev-parse HEAD)
           echo "UPSTREAM_SHA=$sha" >> "$GITHUB_ENV"
+          echo "TAG=build-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
           echo "upstream: $sha $(git log -1 --format=%s)"
 
       - name: Apply patches
@@ -52,7 +83,6 @@ jobs:
             || { echo '::error::region gate patch did not land'; exit 1; }
           grep -q '"SystemSystemUpdate", LauncherAutoUpdateBehavior.Disable' PCL.Core/App/Config.cs \
             || { echo '::error::auto-update default patch did not land'; exit 1; }
-          # 打过补丁后，生产代码里不应再有任何 RegionPolicy.Evaluate 调用（测试目录除外）
           n=$(grep -rn 'RegionPolicy\.Evaluate(' --include=*.cs . | grep -v '^\./PCL.Core.Test/' | wc -l)
           [ "$n" -eq 0 ] || { echo "::error::upstream added RegionPolicy.Evaluate call site(s) outside tests: $n"; exit 1; }
           grep -q 'McDownloadClient(' 'Plain Craft Launcher 2/Pages/PageDownload/ModDownloadLib.cs' \
@@ -83,7 +113,6 @@ jobs:
           cp 'artifact/Plain Craft Launcher 2.exe' dist/PCL-CE-Custom-x64.exe
           ls -lh dist
           if [ -n "$CLIENT_ID" ]; then echo 'CLIENT_ID: set'; else echo 'CLIENT_ID: not set'; fi
-          # 密文在程序集里是 UTF-16 字符串，用 strings -el 校验是否真的编进产物
           if [ -n "$CLIENT_ID" ]; then
             strings -el dist/PCL-CE-Custom-x64.exe | grep -qF "$CLIENT_ID" \
               && echo 'client id found in binary' \
@@ -92,9 +121,11 @@ jobs:
           {
             echo '解除区域限制 + 默认关闭自动更新检查。'
             echo
-            echo "- 上游提交：\`$UPSTREAM_SHA\`"
+            echo "- 上游提交：\`$(echo $UPSTREAM_SHA | cut -c1-7)\`"
             echo "- 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
             echo "- 补丁：$(ls ../patches | tr '\n' ' ')"
+            echo
+            echo "<!-- upstream:$UPSTREAM_SHA -->"
           } > body.md
           cat body.md
 
@@ -105,8 +136,42 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: custom-latest
-          name: 定制构建（随上游更新）
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
           body_path: body.md
           files: dist/PCL-CE-Custom-x64.exe
           make_latest: true
+
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName,publishedAt > rels.json
+          python3 - <<'PY' > delete.txt
+          import json, datetime
+          rels = json.load(open('rels.json'))
+          now = datetime.datetime.now(datetime.timezone.utc)
+          cut = now - datetime.timedelta(days=30)
+          keep = set()
+          months = {}
+          for r in rels:
+              t = datetime.datetime.fromisoformat(r['publishedAt'].replace('Z', '+00:00'))
+              if t >= cut:
+                  keep.add(r['tagName'])
+              else:
+                  months.setdefault(t.strftime('%Y-%m'), []).append((t, r['tagName']))
+          for items in months.values():
+              items.sort()
+              keep.add(items[-1][1])
+          for r in rels:
+              if r['tagName'] not in keep:
+                  print(r['tagName'])
+          PY
+          echo '--- keep / delete ---'
+          cat delete.txt
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done < delete.txt
