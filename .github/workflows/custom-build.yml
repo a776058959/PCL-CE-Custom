@@ -145,6 +145,7 @@ jobs:
           name=$(gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .name 2>/dev/null || true)
           gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .body > upstream-body.md 2>/dev/null || true
           if [ -z "$name" ]; then name="Release ${REF#v}"; fi
+          curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM_SLUG/$REF/Plain%20Craft%20Launcher%202/metadata.json" -o meta.json || true
           echo "RELEASE_NAME=$name" >> "$GITHUB_ENV"
 
       - name: Assemble dist
@@ -210,10 +211,15 @@ jobs:
           X64_SHA=$(sha256sum "dist/PCL-CE-Custom-$TAG-x64.exe" | cut -d' ' -f1)
           ARM_SHA=$(sha256sum "dist/PCL-CE-Custom-$TAG-arm64.exe" | cut -d' ' -f1)
           echo "x64=$X64_SHA"; echo "arm64=$ARM_SHA"
-          X64_SHA="$X64_SHA" ARM_SHA="$ARM_SHA" python3 - <<'PY'
+          REF="${{ needs.check.outputs.ref }}" X64_SHA="$X64_SHA" ARM_SHA="$ARM_SHA" python3 - <<'PY'
           import json, os, hashlib, pathlib
-          meta = json.load(open('src/Plain Craft Launcher 2/metadata.json', encoding='utf-8'))['version']
-          name = meta['base'] + (('-' + meta['suffix']) if meta.get('suffix') else '')
+          try:
+              meta = json.load(open('meta.json', encoding='utf-8'))['version']
+              name = meta['base'] + (('-' + meta['suffix']) if meta.get('suffix') else '')
+              code = meta['code']
+          except FileNotFoundError:
+              name = os.environ.get('REF', '').lstrip('v')
+              code = 0
           repo, tag = os.environ['GITHUB_REPOSITORY'], os.environ['TAG']
           try:
               changelog = open('upstream-body.md', encoding='utf-8').read()
@@ -225,7 +231,7 @@ jobs:
               zip_name = 'PCL-CE-Custom-%s-%s.zip' % (tag, arch)
               asset = {
                   'file_name': zip_name,
-                  'version': {'channel': 'stable', 'name': name, 'code': meta['code']},
+                  'version': {'channel': 'stable', 'name': name, 'code': code},
                   'upd_time': tag,
                   'downloads': ['https://github.com/%s/releases/download/%s/%s' % (repo, tag, zip_name)],
                   'patches': [],
@@ -239,7 +245,7 @@ jobs:
           ann.write_text(json.dumps({'content': []}, ensure_ascii=False), encoding='utf-8')
           cache['announcement'] = hashlib.md5(ann.read_bytes()).hexdigest()
           pathlib.Path('apiv2/cache.json').write_text(json.dumps(cache, indent=2), encoding='utf-8')
-          print('version:', name, 'code:', meta['code'])
+          print('version:', name, 'code:', code)
           print('cache:', cache)
           PY
 
