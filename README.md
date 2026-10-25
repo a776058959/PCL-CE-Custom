@@ -31,13 +31,27 @@ fork 意味着本地背着上游的完整历史和几万个文件，每次上游
 
 每次构建结束时自动清理，不需要手动删。
 
+## 产物
+
+每个版本出四种，文件名带版本号与架构：
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `PCL-CE-Custom-v2.15.1-x64.exe` | ~22 MB | 常规版，需要机器装有 .NET 10 Desktop Runtime |
+| `PCL-CE-Custom-v2.15.1-x64-bundled.exe` | ~187 MB | 自带运行时，无依赖 |
+| `PCL-CE-Custom-v2.15.1-arm64.exe` | ~22 MB | ARM64 常规版 |
+| `PCL-CE-Custom-v2.15.1-arm64-bundled.exe` | ~200 MB | ARM64 自带运行时 |
+| `...-x64.zip` / `...-arm64.zip` | ~10 MB | 启动器内自动更新用，不用手动下 |
+
+启动器的自动更新按架构各自取对应的 zip（`updates-srx64` / `updates-srarm64` 两个通道）。
+
 ## 启动器内更新
 
 构建产物自己带更新源，指向本仓库：
 
 - 补丁把 `UpdateManager.remoteServer` 换成本仓库的 raw 地址，不再查上游（自动检查更新是开着的，检查的就是本仓库）
 - 每次构建自动生成 `apiv2/cache.json`、`apiv2/updates/updates-srx64.json`、`apiv2/announcement.json` 并提交
-- 更新包 `PCL-CE-Custom-<tag>-x64.zip` 随 Release 一起发布（资产名带版本号，例如 `PCL-CE-Custom-v2.15.1-x64.exe`），`sha256` 字段填的是**解压后 exe** 的哈希（上游更新器就是这么校验的）
+- 更新包 `PCL-CE-Custom-<tag>-<arch>.zip` 随 Release 一起发布，按架构分通道，`sha256` 字段填的是**解压后 exe** 的哈希（上游更新器就是这么校验的）
 
 所以启动器里点「检查更新」查的是本仓库的最新版本；上游发新版后，本仓库生成对应版本，启动器就能直接更新到新的定制版。
 
