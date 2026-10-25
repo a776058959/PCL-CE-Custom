@@ -2,7 +2,7 @@ name: Custom build
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '0 */8 * * *'
   workflow_dispatch:
     inputs:
       ref:
@@ -24,6 +24,7 @@ concurrency:
 
 env:
   UPSTREAM_REPO: https://github.com/PCL-Community/PCL-CE.git
+  UPSTREAM_SLUG: PCL-Community/PCL-CE
 
 jobs:
   check:
@@ -46,7 +47,7 @@ jobs:
           if [ -n "$WANT" ]; then
             ref="$WANT"
           else
-            ref=$(gh api repos/PCL-Community/PCL-CE/releases/latest --jq .tag_name)
+            ref=$(gh api "repos/$UPSTREAM_SLUG/releases/latest" --jq .tag_name)
           fi
           locked=$(tr -d '[:space:]' < .github/upstream-lock.txt 2>/dev/null || true)
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
@@ -63,7 +64,6 @@ jobs:
               fi
               ;;
             *)
-              # 分支（如 dev）内容会变，锁文件无法表达，一律构建
               echo 'changed=true' >> "$GITHUB_OUTPUT"
               echo "$ref 是分支，直接构建"
               ;;
@@ -86,10 +86,26 @@ jobs:
           echo "UPSTREAM_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "UPSTREAM_REF=$REF" >> "$GITHUB_ENV"
           case "$REF" in
-            v*) echo "TAG=custom-$REF" >> "$GITHUB_ENV" ;;
+            v*) echo "TAG=$REF" >> "$GITHUB_ENV" ;;
             *)  echo "TAG=custom-$REF-$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV" ;;
           esac
           echo "upstream: $REF $(git log -1 --format=%h\ %s)"
+
+      # 发版说明直接沿用上游那一版的，保证版本号与更新日志一致
+      - name: Fetch upstream release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.check.outputs.ref }}
+        run: |
+          upstream_name=$(gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .name 2>/dev/null || true)
+          gh api "repos/$UPSTREAM_SLUG/releases/tags/$REF" --jq .body > upstream-body.md 2>/dev/null || true
+          if [ -z "$upstream_name" ]; then upstream_name="Release ${REF#v}"; fi
+          {
+            echo "RELEASE_NAME=$upstream_name"
+            echo "UPSTREAM_BODY_BYTES=$(wc -c < upstream-body.md 2>/dev/null || echo 0)"
+          } >> "$GITHUB_ENV"
+          echo "release name: $upstream_name"
+          echo "upstream body bytes: $(wc -c < upstream-body.md 2>/dev/null || echo 0)"
 
       - name: Apply patches
         working-directory: src
@@ -144,14 +160,15 @@ jobs:
               || echo '::warning::CLIENT_ID 已配置但未在产物中找到，检查 PCL_WRITE_SECRET 与 env 变量名'
           fi
           {
-            echo "基于上游 \`$UPSTREAM_REF\` 构建，已解除区域限制并默认关闭自动检查更新。"
-            echo
-            echo "- 上游版本：\`$UPSTREAM_REF\`"
-            echo "- 上游提交：\`$(echo $UPSTREAM_SHA | cut -c1-7)\`"
-            echo "- 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
-            echo "- 补丁：$(ls patches | tr '\n' ' ')"
+            echo "> **本版基于上游 \`$UPSTREAM_REF\`（提交 \`$(echo $UPSTREAM_SHA | cut -c1-7)\`）自行编译，解除了中国大陆地区的下载/安装限制，并默认关闭自动检查更新。**"
+            echo ">"
+            echo "> 构建于 $(date -u '+%Y-%m-%d %H:%M UTC')，补丁：$(ls patches | tr '\n' ' ')"
+            echo ""
+            echo "---"
+            echo ""
+            cat upstream-body.md 2>/dev/null || true
           } > body.md
-          cat body.md
+          head -6 body.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -161,7 +178,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
-          name: ${{ env.TAG }}
+          name: ${{ env.RELEASE_NAME }}
           body_path: body.md
           files: dist/PCL-CE-Custom-x64.exe
           make_latest: true
@@ -200,7 +217,6 @@ jobs:
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < delete.txt
 
-  # 构建成功后把「这次基于上游哪个 tag」写进锁文件，作为下次判定的唯一依据
   record:
     needs: [check, build]
     if: needs.check.outputs.changed == 'true' && needs.build.result == 'success'
@@ -212,7 +228,7 @@ jobs:
           REF: ${{ needs.check.outputs.ref }}
         run: |
           set -e
-          printf '%s\n' "$REF" > .github/upstream-lock.txt
+          case "$REF" in v*) printf '%s\n' "$REF" > .github/upstream-lock.txt ;; *) echo '分支构建不写锁文件' ;; esac
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add .github/upstream-lock.txt
