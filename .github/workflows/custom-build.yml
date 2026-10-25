@@ -13,6 +13,7 @@ on:
     branches: [main]
     paths-ignore:
       - '**/*.md'
+      - '.github/upstream-lock.txt'
 
 permissions:
   contents: write
@@ -28,38 +29,45 @@ jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      ref: ${{ steps.up.outputs.ref }}
+      ref: ${{ steps.cmp.outputs.ref }}
       changed: ${{ steps.cmp.outputs.changed }}
     steps:
-      - name: Resolve upstream ref
-        id: up
+      - uses: actions/checkout@v4
+
+      # 判定依据是仓库里的 .github/upstream-lock.txt（上次成功构建的上游 tag），
+      # 不依赖 release 列表，也不会被保留策略清理掉。
+      - name: Compare upstream release tag with lock file
+        id: cmp
         env:
           GH_TOKEN: ${{ github.token }}
           WANT: ${{ github.event.inputs.ref }}
         run: |
+          set -e
           if [ -n "$WANT" ]; then
             ref="$WANT"
           else
             ref=$(gh api repos/PCL-Community/PCL-CE/releases/latest --jq .tag_name)
           fi
+          locked=$(tr -d '[:space:]' < .github/upstream-lock.txt 2>/dev/null || true)
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "upstream ref: $ref"
-
-      - name: Compare with existing builds
-        id: cmp
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REF: ${{ steps.up.outputs.ref }}
-        run: |
-          hits=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].body' 2>/dev/null \
-            | grep -cF "<!-- upstream:$REF -->" || true)
-          if [ "${hits:-0}" -gt 0 ]; then
-            echo 'changed=false' >> "$GITHUB_OUTPUT"
-            echo "$REF 已经构建过，跳过"
-          else
-            echo 'changed=true' >> "$GITHUB_OUTPUT"
-            echo "$REF 还没构建过，开始"
-          fi
+          echo "上游目标: $ref"
+          echo "上次构建: ${locked:-（无记录）}"
+          case "$ref" in
+            v*)
+              if [ "$ref" = "$locked" ]; then
+                echo 'changed=false' >> "$GITHUB_OUTPUT"
+                echo "$ref 已构建过，跳过"
+              else
+                echo 'changed=true' >> "$GITHUB_OUTPUT"
+                echo "$ref 是新版本，开始构建"
+              fi
+              ;;
+            *)
+              # 分支（如 dev）内容会变，锁文件无法表达，一律构建
+              echo 'changed=true' >> "$GITHUB_OUTPUT"
+              echo "$ref 是分支，直接构建"
+              ;;
+          esac
 
   build:
     needs: check
@@ -142,8 +150,6 @@ jobs:
             echo "- 上游提交：\`$(echo $UPSTREAM_SHA | cut -c1-7)\`"
             echo "- 构建时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
             echo "- 补丁：$(ls patches | tr '\n' ' ')"
-            echo
-            echo "<!-- upstream:$UPSTREAM_REF -->"
           } > body.md
           cat body.md
 
@@ -163,6 +169,7 @@ jobs:
       - name: Prune old releases
         env:
           GH_TOKEN: ${{ github.token }}
+          DRY_RUN: '0'
         run: |
           set -e
           gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,publishedAt > rels.json
@@ -189,5 +196,30 @@ jobs:
           cat delete.txt
           while read -r tag; do
             [ -z "$tag" ] && continue
+            if [ "$DRY_RUN" = '1' ]; then echo "[dry-run] would delete $tag"; continue; fi
             gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done < delete.txt
+
+  # 构建成功后把「这次基于上游哪个 tag」写进锁文件，作为下次判定的唯一依据
+  record:
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update lock file
+        env:
+          REF: ${{ needs.check.outputs.ref }}
+        run: |
+          set -e
+          printf '%s\n' "$REF" > .github/upstream-lock.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/upstream-lock.txt
+          if git diff --cached --quiet; then
+            echo '锁文件未变化'
+          else
+            git commit -m "chore(ci): upstream $REF built [skip ci]"
+            git push origin HEAD:main
+            echo "已记录 $REF"
+          fi
