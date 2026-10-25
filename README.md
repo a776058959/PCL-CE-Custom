@@ -7,7 +7,6 @@
 | 改动 | 效果 |
 |---|---|
 | `RestrictedFeaturePolicy.Assess()` 恒定返回非受限 | 解除中国大陆地区对 Minecraft 下载、安装、补全、整合包的封锁 |
-| `Config.Update.UpdateMode` 默认值改为 `Disable` | 新装版本不自动检查更新，避免被官方受限版覆盖 |
 
 ## 为什么不用 fork
 
@@ -36,7 +35,7 @@ fork 意味着本地背着上游的完整历史和几万个文件，每次上游
 
 构建产物自己带更新源，指向本仓库：
 
-- 补丁把 `UpdateManager.remoteServer` 换成本仓库的 raw 地址，不再查上游
+- 补丁把 `UpdateManager.remoteServer` 换成本仓库的 raw 地址，不再查上游（自动检查更新是开着的，检查的就是本仓库）
 - 每次构建自动生成 `apiv2/cache.json`、`apiv2/updates/updates-srx64.json`、`apiv2/announcement.json` 并提交
 - 更新包 `PCL-CE-Custom-x64.zip` 随 Release 一起发布，`sha256` 字段填的是**解压后 exe** 的哈希（上游更新器就是这么校验的）
 

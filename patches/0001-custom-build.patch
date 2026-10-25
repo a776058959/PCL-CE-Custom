@@ -1,16 +1,3 @@
-diff --git a/PCL.Core/App/Config.cs b/PCL.Core/App/Config.cs
-index d97d3fa1..3dd5a53f 100644
---- a/PCL.Core/App/Config.cs
-+++ b/PCL.Core/App/Config.cs
-@@ -120,7 +120,7 @@ public static partial class Config
-         /// <summary>
-         /// 自动更新行为。
-         /// </summary>
--        [ConfigItem<LauncherAutoUpdateBehavior>("SystemSystemUpdate", LauncherAutoUpdateBehavior.DownloadAndAnnounce, ConfigSource.Local)] public partial LauncherAutoUpdateBehavior UpdateMode { get; set; }
-+        [ConfigItem<LauncherAutoUpdateBehavior>("SystemSystemUpdate", LauncherAutoUpdateBehavior.Disable, ConfigSource.Local)] public partial LauncherAutoUpdateBehavior UpdateMode { get; set; }
- 
-         /// <summary>
-         /// 更新分支。
 diff --git a/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs b/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs
 index 252e4bb0..9779aaa1 100644
 --- a/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs	

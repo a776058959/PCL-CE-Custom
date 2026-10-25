@@ -97,8 +97,6 @@ jobs:
           set -e
           grep -q 'local-build-unrestricted' 'Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs' \
             || { echo '::error::region gate patch did not land'; exit 1; }
-          grep -q '"SystemSystemUpdate", LauncherAutoUpdateBehavior.Disable' PCL.Core/App/Config.cs \
-            || { echo '::error::auto-update default patch did not land'; exit 1; }
           grep -q 'raw.githubusercontent.com/a776058959/PCL-CE-Custom' 'Plain Craft Launcher 2/Modules/Updates/UpdateManager.cs' \
             || { echo '::error::update source patch did not land'; exit 1; }
           n=$(grep -rn 'RegionPolicy\.Evaluate(' --include=*.cs . | grep -v '^\./PCL.Core.Test/' | wc -l)
@@ -137,13 +135,14 @@ jobs:
               || echo '::warning::CLIENT_ID 已配置但未在产物中找到，检查 PCL_WRITE_SECRET 与 env 变量名'
           fi
           {
-            echo "> **本版基于上游 \`$UPSTREAM_REF\`（提交 \`$(echo $UPSTREAM_SHA | cut -c1-7)\`）自行编译，解除了中国大陆地区的下载/安装限制，并默认关闭自动检查更新。**"
+            echo "> **本版基于上游 \`$UPSTREAM_REF\`（提交 \`$(echo $UPSTREAM_SHA | cut -c1-7)\`）自行编译，解除了中国大陆地区的下载/安装限制。更新由本仓库提供，不是官方发布。**"
             echo ">"
             echo "> 构建于 $(date -u '+%Y-%m-%d %H:%M UTC')，补丁：$(ls patches | tr '\n' ' ')"
             echo ""
             echo "---"
             echo ""
-            cat upstream-body.md 2>/dev/null || true
+            # 去掉上游正文里的 Mirror 酱广告（我们没有那个通道）
+            grep -v -i 'mirror 酱\|mirrorchyan\|你也可以直接在下方' upstream-body.md 2>/dev/null || true
           } > body.md
           head -6 body.md
 
